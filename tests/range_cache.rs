@@ -577,6 +577,254 @@ async fn only_configured_upstream_is_reachable() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. Client version lock (If-Match with exactly one STRONG ETag): the proxy
+//     confirms the upstream's current version first, then serves that exact
+//     representation full or by range; a same-length swap fails with 412 and
+//     never returns an object body; malformed locks are 400; weak/missing
+//     upstream validators cannot honor a lock. Plain requests are unaffected.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lock_matching_version_serves_full_and_single_range_with_exact_bytes() {
+    let env = spawn_env().await;
+    let total = 300_000usize;
+    let expected = support::object_bytes("alpha-v1", total);
+    reset_stats(&env).await;
+
+    // Locked full GET on a cold cache: upstream must be probed (HEAD) and
+    // the body delivered with the locked validator.
+    let resp = get(&env, "/obj/alpha", &[("If-Match", "\"alpha-v1\"")]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), total);
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected));
+    let st = stats_for(&env, "alpha").await;
+    assert!(st["head_probes"] >= 1, "version must be probed first");
+    assert_eq!(st["full_200"], 1);
+
+    // A second locked full GET, now fully cached: confirm with HEAD again
+    // but serve the body from disk — no second upstream body transfer.
+    let before2 = stats_for(&env, "alpha").await;
+    let resp = get(&env, "/obj/alpha", &[("If-Match", "\"alpha-v1\"")]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected));
+    let after2 = stats_for(&env, "alpha").await;
+    assert_eq!(
+        after2["bytes_sent"],
+        before2["bytes_sent"],
+        "cached locked full GET transfers no object bytes"
+    );
+    assert_eq!(after2["full_200"], 1, "no second upstream 200");
+
+    // A locked single interval already fully cached: one HEAD probe, a 304
+    // revalidation and zero extra object bytes.
+    let before = stats_for(&env, "alpha").await;
+    let resp = get(
+        &env,
+        "/obj/alpha",
+        &[("Range", "bytes=100-199"), ("If-Match", "\"alpha-v1\"")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    assert_eq!(
+        hdr(&resp, "content-range"),
+        Some("bytes 100-199/300000")
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 100);
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected[100..200]));
+    let after = stats_for(&env, "alpha").await;
+    assert_eq!(
+        after["bytes_sent"],
+        before["bytes_sent"],
+        "locked cached range must not transfer object bytes"
+    );
+    assert!(after["head_probes"] >= before["head_probes"] + 1);
+}
+
+#[tokio::test]
+async fn lock_fills_gaps_of_pinned_version_with_correct_bytes() {
+    let env = spawn_env().await;
+    let total = 300_000usize;
+    let expected = support::object_bytes("alpha-v1", total);
+    reset_stats(&env).await;
+
+    // Cold locked range establishes the pinned version via 206.
+    let resp = get(
+        &env,
+        "/obj/alpha",
+        &[("Range", "bytes=1000-1999"), ("If-Match", "\"alpha-v1\"")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected[1000..2000]));
+
+    // Locked range spanning a gap: only [0,1000) is fetched, under the
+    // locked strong tag; merged bytes must be exactly the pinned content.
+    let resp = get(
+        &env,
+        "/obj/alpha",
+        &[("Range", "bytes=0-1999"), ("If-Match", "\"alpha-v1\"")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 2000);
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected[0..2000]));
+    let st = stats_for(&env, "alpha").await;
+    assert_eq!(st["bytes_sent"], 2000, "only the gap is transferred");
+}
+
+#[tokio::test]
+async fn lock_old_value_fails_after_same_length_version_swap() {
+    let env = spawn_env().await;
+    let len = 120_000usize;
+    let v0 = support::mutable_bytes(0, len);
+    reset_stats(&env).await;
+
+    // Warm and confirm v0 under the lock.
+    let resp = get(&env, "/obj/mutable", &[("If-Match", "\"mutable-v0\"")]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v0));
+
+    // Upstream rolls to v1: same length, different bytes and ETag.
+    let roll = env
+        .client
+        .post(format!("{}/obj/mutable", env.upstream))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(roll.status(), 200);
+    let v1 = support::mutable_bytes(1, len);
+    assert_ne!(sha256_hex(&v0), sha256_hex(&v1));
+
+    // Locking the OLD version must fail with 412, echo the current strong
+    // validator and carry NO object body (neither old nor new bytes).
+    let resp = get(&env, "/obj/mutable", &[("If-Match", "\"mutable-v0\"")]).await;
+    assert_eq!(resp.status(), 412);
+    assert_eq!(
+        hdr(&resp, "etag"),
+        Some("\"mutable-v1\""),
+        "412 must identify the current version"
+    );
+    assert!(hdr(&resp, "content-range").is_none());
+    let body = resp.bytes().await.unwrap();
+    // The only allowed body is the short error explanation, never bytes of
+    // either representation.
+    assert!(
+        body.len() < 512,
+        "412 must not return an object body, got {} bytes",
+        body.len()
+    );
+    assert_ne!(body.as_ref(), &v1[..body.len().min(len)]);
+
+    // Same for a range request pinned to the old version.
+    let resp = get(
+        &env,
+        "/obj/mutable",
+        &[("Range", "bytes=0-99"), ("If-Match", "\"mutable-v0\"")],
+    )
+    .await;
+    assert_eq!(resp.status(), 412);
+    assert_eq!(hdr(&resp, "etag"), Some("\"mutable-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert!(body.len() < 512, "no range bytes may be returned");
+    assert_ne!(sha256_hex(&body), sha256_hex(&v0[0..100]));
+    assert_ne!(sha256_hex(&body), sha256_hex(&v1[0..100]));
+
+    // A lock on the NEW version succeeds and returns new bytes.
+    let resp = get(&env, "/obj/mutable", &[("If-Match", "\"mutable-v1\"")]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hdr(&resp, "etag"), Some("\"mutable-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1));
+
+    // Ordinary (unlocked) requests still succeed against the new version.
+    let resp = get(&env, "/obj/mutable", &[]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1));
+    let resp = get(&env, "/obj/mutable", &[("Range", "bytes=0-99")]).await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1[0..100]));
+}
+
+#[tokio::test]
+async fn malformed_if_match_lock_is_400_and_does_not_touch_upstream() {
+    let env = spawn_env().await;
+    reset_stats(&env).await;
+
+    for bad in [
+        "*",
+        "",
+        "v1",
+        "W/\"alpha-v1\"",
+        "\"v1\", \"v2\"",
+        "\"v1\",",
+        "  ",
+    ] {
+        let resp = get(&env, "/obj/alpha", &[("If-Match", bad)]).await;
+        assert_eq!(resp.status(), 400, "lock value {bad:?} must be rejected");
+        let body = resp.text().await.unwrap();
+        assert!(!body.is_empty(), "400 must explain why {bad:?} failed");
+    }
+
+    // Nothing was fetched: no version of the object exists.
+    let count = count_rows(
+        &env,
+        "SELECT COUNT(*) FROM versions v JOIN objects o ON o.id = v.object_id
+         WHERE o.path = '/obj/alpha'",
+    );
+    assert_eq!(count, 0);
+    let st = stats_for(&env, "alpha").await;
+    assert_eq!(
+        st.get("requests").copied().unwrap_or(0),
+        0,
+        "rejected locks must not reach upstream"
+    );
+
+    // Ordinary GET still works.
+    let resp = get(&env, "/obj/alpha", &[]).await;
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn lock_against_weak_or_missing_validator_is_precondition_failure() {
+    let env = spawn_env().await;
+
+    // Upstream only has a weak ETag: exact bytes cannot be guaranteed.
+    let resp = get(&env, "/obj/weak", &[("If-Match", "\"weak-v1\"")]).await;
+    assert_eq!(resp.status(), 412);
+    let body = resp.bytes().await.unwrap();
+    assert!(body.len() < 512, "no object body, only an explanation");
+
+    // Even a strong-looking lock against the weak object fails the probe.
+    let resp = get(&env, "/obj/weak", &[("If-Match", "\"anything\"")]).await;
+    assert_eq!(resp.status(), 412);
+
+    // Object with no validator at all.
+    let resp = get(&env, "/obj/noetag", &[("If-Match", "\"noetag-v1\"")]).await;
+    assert_eq!(resp.status(), 412);
+    let body = resp.bytes().await.unwrap();
+    assert!(body.len() < 512, "no object body, only an explanation");
+
+    // Plain requests to both objects are unaffected (pass-through).
+    let resp = get(&env, "/obj/weak", &[]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hdr(&resp, "etag"), Some("W/\"weak-v1\""));
+    let resp = get(&env, "/obj/noetag", &[]).await;
+    assert_eq!(resp.status(), 200);
+    assert!(hdr(&resp, "etag").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

@@ -32,6 +32,26 @@
   （强 ETag / 弱 ETag 拒绝 / HTTP-date）、206 `Content-Range`、416
   `bytes */<length>`。多区间请求透传，不生成 multipart/byteranges。
 
+## 客户端版本锁定（可选，`If-Match`）
+
+自动化测试可在请求里带**且仅带一个强 ETag** 的 `If-Match: "<etag>"`，把一次
+下载钉死在“刚确认的那个版本”上：
+
+1. 代理先向上游发一次**无正文的 HEAD** 确认当前版本；
+2. 当前强 ETag 与锁定值一致，才决定从该版本自己的缓存 blob 读取整段/区间，
+   或只用带 `If-Range: "<lock>"` 的请求补齐缺口；
+3. 当前强 ETag 与锁定值不同（包括“同长度悄悄换版”），或回源期间对象变化，
+   返回 **412 Precondition Failed**——响应里回带当前 `ETag` 便于客户端识别，
+   **绝不传回旧版或新版的对象正文**；
+4. 上游当前只有弱 ETag 或根本没有验证器，锁定无法保证字节一致，同样返回 412
+   说明“无法保证”；
+5. 弱 `W/`、标签列表、`*`、未加引号/无法解析的 `If-Match` 值在读取阶段即以
+   **400** 拒绝（不回源）；
+6. 不带 `If-Match` 的普通 GET/Range 走原有策略，行为完全不变。
+
+锁定请求针对的是缓存里 ETag 对应的那个版本（即使已出现更新的版本也不顶替）；
+多区间锁定请求原样转发并在收到后核验 ETag，不参与区段合并。
+
 ## 存储布局
 
 ```
@@ -58,7 +78,8 @@ cargo run --release --bin proxy
 
 测试上游提供：`/obj/alpha` `/obj/tiny` `/obj/weak` `/obj/noetag`
 `/obj/slow?ms=&len=` `/obj/truncated` `/obj/ignores-range` `/obj/mutable`
-（POST 切换同长度新版本）`/redir`（跳外部）`/stats`。
+（POST 切换同长度新版本）`/redir`（跳外部）`/stats`。所有对象同时支持
+`HEAD`（只回验证器，用于版本锁确认，不产生正文流量）。
 
 ## 测试
 
@@ -66,13 +87,16 @@ cargo run --release --bin proxy
 cargo test --features test-support
 ```
 
-- 9 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
-  If-Range 规则。
-- 12 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
+- 10 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
+  If-Range 规则、`If-Match` 版本锁的严格解析（单强标签，拒绝弱/列表/`*`）。
+- 17 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
   bytes=-0 与越界 416、上游忽略 Range（200 提交）、If-Range 强/弱/陈旧、
   同长度对象换版、缓存命中 304 强校验零额外字节、上游 Content-Length 说谎、
   客户端断开取消回源且不落缓存、blob 被截断后不返回短成功响应、
-  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）。
+  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向），以及版本锁：
+  锁定一致版本的全量与单区间字节正确（缓存命中只发 HEAD、缺口只传缺口）、
+  同长度换版后锁定旧值返回 412 且无对象正文、普通请求仍按新版本获取、
+  格式错误锁值 400 不回源、弱/无验证器上游返回 412 说明无法保证。
 
 所有涉及字节的断言都比对实际响应体的 SHA-256 与期望切片摘要，而非仅看
 状态码或响应头。

@@ -51,6 +51,59 @@ pub fn strong_equal(a: &ETag, b: &ETag) -> bool {
     !a.weak && !b.weak && a.raw_tag == b.raw_tag
 }
 
+/// Why an `If-Match` version-lock value could not be accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockError {
+    /// Empty value, `*`, an unquoted/garbage tag — not one entity-tag.
+    Malformed,
+    /// More than one entity-tag (an If-Match list). A version lock pins one
+    /// exact representation, so a list is ambiguous.
+    Multiple,
+    /// The single tag uses the weak `W/` form and cannot prove byte identity.
+    Weak,
+}
+
+/// Parse the client's `If-Match` value as a version lock.
+///
+/// A download pinned to one exact representation accepts **exactly one
+/// STRONG entity-tag**. Rejected:
+/// - `*` (matches *any* current version — does not pin bytes),
+/// - comma-separated tag lists (ambiguous which representation is wanted),
+/// - weak `W/"..."` tags (only semantic equivalence, never byte identity),
+/// - anything that is not a single well-formed quoted entity-tag.
+///
+/// Commas are only treated as list separators while outside double quotes,
+/// since an opaque tag may legitimately contain a comma.
+pub fn parse_if_match_lock(value: &str) -> Result<ETag, LockError> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(LockError::Malformed);
+    }
+    let mut tags: Vec<&str> = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0usize;
+    for (i, b) in v.bytes().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                tags.push(v[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    tags.push(v[start..].trim());
+    if tags.len() > 1 {
+        return Err(LockError::Multiple);
+    }
+    let tag = ETag::parse(tags[0]).ok_or(LockError::Malformed)?;
+    if tag.weak {
+        Err(LockError::Weak)
+    } else {
+        Ok(tag)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +127,39 @@ mod tests {
         assert!(ETag::parse("\"a\" \"b\"").is_none());
         assert_eq!(s.to_wire(), "\"abc\"");
         assert_eq!(w.to_wire(), "W/\"abc\"");
+    }
+
+    #[test]
+    fn if_match_lock_must_be_one_strong_tag() {
+        // Exactly one strong tag is the only accepted lock value.
+        let lock = parse_if_match_lock("\"alpha-v1\"").unwrap();
+        assert!(!lock.weak && lock.raw_tag == "alpha-v1");
+        assert!(parse_if_match_lock("  \"v 1\"  ").unwrap().raw_tag == "v 1");
+        // A comma inside quotes is part of the tag, not a list separator.
+        assert_eq!(
+            parse_if_match_lock("\"a,b\"").unwrap().raw_tag,
+            "a,b"
+        );
+        // Weak tags can never pin exact bytes.
+        assert_eq!(
+            parse_if_match_lock("W/\"v1\""),
+            Err(LockError::Weak)
+        );
+        assert_eq!(
+            parse_if_match_lock("w/\"v1\""),
+            Err(LockError::Weak)
+        );
+        // Tag lists do not identify one representation.
+        assert_eq!(
+            parse_if_match_lock("\"a\", \"b\""),
+            Err(LockError::Multiple)
+        );
+        // The wildcard matches any version, so it is not a lock.
+        assert_eq!(parse_if_match_lock("*"), Err(LockError::Malformed));
+        // Empty / unquoted / garbage are rejected.
+        assert_eq!(parse_if_match_lock(""), Err(LockError::Malformed));
+        assert_eq!(parse_if_match_lock("v1"), Err(LockError::Malformed));
+        // A list of two values is rejected as multiple, even if one is junk.
+        assert_eq!(parse_if_match_lock("\"a\", junk"), Err(LockError::Multiple));
     }
 }

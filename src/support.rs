@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::stream;
@@ -39,6 +39,8 @@ struct Stat {
     partial_206: u64,
     range_416: u64,
     if_range_seen: u64,
+    /// Bodyless HEAD probes (the proxy's version-lock confirmation).
+    head_probes: u64,
     bytes_sent: u64,
 }
 
@@ -46,12 +48,13 @@ impl Stat {
     fn json(&self, name: &str) -> String {
         format!(
             "{{\"name\":\"{name}\",\"requests\":{},\"full_200\":{},\"partial_206\":{},\
-             \"range_416\":{},\"if_range_seen\":{},\"bytes_sent\":{}}}",
+             \"range_416\":{},\"if_range_seen\":{},\"head_probes\":{},\"bytes_sent\":{}}}",
             self.requests,
             self.full_200,
             self.partial_206,
             self.range_416,
             self.if_range_seen,
+            self.head_probes,
             self.bytes_sent
         )
     }
@@ -177,6 +180,7 @@ fn bump(stats: &Arc<Mutex<HashMap<String, Stat>>>, name: &str, f: impl FnOnce(&m
 async fn get_object(
     State(st): State<UpState>,
     Path(name): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let mut spec = match spec_for(&name) {
@@ -193,6 +197,22 @@ async fn get_object(
     bump(&st.stats, &name, |s| s.requests += 1);
     if headers.contains_key(axum::http::header::IF_RANGE) {
         bump(&st.stats, &name, |s| s.if_range_seen += 1);
+    }
+
+    // Bodyless HEAD: report metadata/validators only. The proxy uses this to
+    // confirm the current version for an If-Match lock; no object bytes move.
+    if method == Method::HEAD {
+        bump(&st.stats, &name, |s| s.head_probes += 1);
+        let len = spec.length as u64;
+        let mut h = base_headers(&spec, &spec.etag_seed);
+        h.insert(
+            axum::http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&len.to_string()).unwrap(),
+        );
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::OK;
+        resp.headers_mut().extend(h.drain());
+        return resp;
     }
 
     let data: Vec<u8> = if name == "mutable" {
