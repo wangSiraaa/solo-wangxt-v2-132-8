@@ -13,6 +13,13 @@
 //!   client's Range as-is. A strong 206 establishes the version (and its
 //!   total length from Content-Range) and the request is re-planned; a weak
 //!   206 is passed through but never merged; multipart 206 is never cached.
+//! * Optional client version lock: `If-Match` carrying exactly one strong
+//!   entity-tag pins the request to that object version. The current
+//!   version is confirmed upstream (a conditional GET) before any cached
+//!   byte is read or any gap is filled; a mismatch — including a
+//!   same-length content change — fails with 412 Precondition Failed and
+//!   no representation body. Weak lock values (412) and malformed ones
+//!   (400) are rejected, never silently ignored.
 //!
 //! Upstream bodies are spooled to a temp file in full before any bytes are
 //! committed to the cache or sent to the client. A length mismatch becomes
@@ -198,6 +205,7 @@ async fn capture_upstream(
     target: &url::Url,
     range: Option<&str>,
     if_range: Option<&str>,
+    if_none_match: Option<&str>,
 ) -> Result<(reqwest::StatusCode, Captured)> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -210,6 +218,11 @@ async fn capture_upstream(
     if let Some(ir) = if_range {
         if let Ok(v) = HeaderValue::from_str(ir) {
             headers.insert(reqwest::header::IF_RANGE, v);
+        }
+    }
+    if let Some(inm) = if_none_match {
+        if let Ok(v) = HeaderValue::from_str(inm) {
+            headers.insert(reqwest::header::IF_NONE_MATCH, v);
         }
     }
 
@@ -379,8 +392,23 @@ async fn serve(
     let target = resolve_target(&state, uri)?;
     let key = target_key(&target);
 
+    // Optional client version lock (`If-Match` with exactly one strong
+    // entity-tag). Parsed up front: unusable lock values are rejected
+    // outright — a lock request must never degrade into an unlocked one.
+    let lock = parse_version_lock(req_headers)?;
+
     let obj_lock = lock_for(&state, &key).await;
     let _guard = obj_lock.lock().await;
+
+    // With a lock, the CURRENT upstream version is confirmed before any
+    // cached byte is read or any gap is filled.
+    let mut lock_committed: Option<VersionRow> = None;
+    if let Some(l) = &lock {
+        match confirm_lock_version(&state, &target, &key, l).await? {
+            LockCheck::Confirmed => {}
+            LockCheck::Committed(v) => lock_committed = Some(v),
+        }
+    }
 
     let range_raw = req_headers
         .get(axum::http::header::RANGE)
@@ -391,25 +419,57 @@ async fn serve(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let single = match range_raw.as_deref().map(range::parse_range) {
+    let resp = match range_raw.as_deref().map(range::parse_range) {
         // No Range header, or malformed Range we must ignore: plain GET.
-        None | Some(None) => return full_get(&state, &target).await,
+        None | Some(None) => match &lock {
+            Some(l) => locked_full_get(&state, &target, &key, l, lock_committed).await?,
+            None => full_get(&state, &target).await?,
+        },
         Some(Some(RangeSpec::Multiple)) => {
-            return multipart_forward(
+            multipart_forward(
                 &state,
                 &target,
                 range_raw.as_deref(),
                 if_range.as_deref(),
             )
-            .await;
+            .await?
         }
-        Some(Some(RangeSpec::Single(iv))) => iv,
+        Some(Some(RangeSpec::Single(iv))) => {
+            plan_range(
+                &state,
+                &target,
+                &key,
+                iv,
+                range_raw.as_deref(),
+                if_range.as_deref(),
+            )
+            .await?
+        }
     };
 
+    // Final guard for locked requests: a 200/206 may only carry the locked
+    // version's bytes — anything else is answered 412 without a body.
+    match &lock {
+        Some(l) => enforce_version_lock(resp, l),
+        None => Ok(resp),
+    }
+}
+
+/// Serve one single-interval range request: cache hits (after a strong
+/// revalidation), gap fills proven by strong `If-Range`, transparent repair
+/// of damaged blobs.
+async fn plan_range(
+    state: &Arc<ProxyState>,
+    target: &url::Url,
+    key: &str,
+    single: range::RawInterval,
+    range_raw: Option<&str>,
+    if_range: Option<&str>,
+) -> Result<Response> {
     let mut repairs = 0;
     for _ in 0..MAX_PLAN_ITERATIONS {
-        let key_for_db = key.clone();
-        let latest = with_db(&state, move |c| {
+        let key_for_db = key.to_string();
+        let latest = with_db(state, move |c| {
             crate::db::latest_strong_version(c, &key_for_db)
         })
         .await?;
@@ -417,15 +477,7 @@ async fn serve(
             Some(t) => t,
             // Cold / length unknown: forward the client's Range.
             None => {
-                match cold_range(
-                    &state,
-                    &target,
-                    &key,
-                    range_raw.as_deref(),
-                    if_range.as_deref(),
-                )
-                .await?
-                {
+                match cold_range(state, target, key, range_raw, if_range).await? {
                     ColdOutcome::Reply(resp) => return Ok(resp),
                     ColdOutcome::Replan => continue,
                 }
@@ -436,15 +488,7 @@ async fn serve(
         let (start, end_inclusive) = match range::resolve(single, total) {
             Ok(v) => v,
             Err(crate::range::Unsatisfiable) => {
-                return unsatisfiable(
-                    &state,
-                    &target,
-                    &key,
-                    &ver,
-                    total,
-                    range_raw.as_ref().unwrap(),
-                )
-                .await;
+                return unsatisfiable(state, target, key, &ver, total, range_raw.unwrap()).await;
             }
         };
         // Half-open end used for byte arithmetic / segment coverage.
@@ -454,19 +498,18 @@ async fn serve(
         // A weak validator here never matches; on mismatch the *current*
         // full representation must be returned, which means revalidating
         // upstream rather than trusting the cache.
-        if let Some(ir) = if_range.as_deref() {
+        if let Some(ir) = if_range {
             let cur = ETag {
                 weak: false,
                 raw_tag: ver.etag_tag.clone(),
             };
             if !crate::httpdate::if_range_matches(ir, Some(&cur), ver.last_modified) {
-                return full_get(&state, &target).await;
+                return full_get(state, target).await;
             }
         }
 
         let vid = ver.id;
-        let covered =
-            with_db(&state, move |c| crate::db::covered_segments(c, vid)).await?;
+        let covered = with_db(state, move |c| crate::db::covered_segments(c, vid)).await?;
         let gaps = range::missing_within(start, end_excl, &covered);
 
         if !gaps.is_empty() {
@@ -481,12 +524,12 @@ async fn serve(
                 }
                 .to_wire();
                 let (status, cap) =
-                    capture_upstream(&state, &target, Some(&range_hdr), Some(&ir)).await?;
+                    capture_upstream(state, target, Some(&range_hdr), Some(&ir), None).await?;
                 match status {
                     reqwest::StatusCode::PARTIAL_CONTENT => {
                         match store_proven_206(
-                            &state,
-                            &key,
+                            state,
+                            key,
                             Some(&ver),
                             cap,
                             Some((gs, ge)),
@@ -507,7 +550,7 @@ async fn serve(
                         // representation. Commit the new version and return
                         // the complete new body with 200 (RFC 9110 13.1.6),
                         // never splicing it into the old range response.
-                        changed_version = Some(match commit_200(&state, &key, cap).await? {
+                        changed_version = Some(match commit_200(state, key, cap).await? {
                             CommitOutcome::Strong(v) => v,
                             CommitOutcome::Uncached(_) => {
                                 return Err(ProxyError::TruncatedUpstream)
@@ -520,7 +563,7 @@ async fn serve(
             }
             if let Some(newver) = changed_version {
                 let len = newver.total_length.unwrap();
-                let body = read_checked(&state, newver.id, 0, len).await?;
+                let body = read_checked(state, newver.id, 0, len).await?;
                 return Ok(build_response(
                     StatusCode::OK,
                     common_headers(&newver),
@@ -532,7 +575,7 @@ async fn serve(
             // proof: two representations may have identical lengths, so
             // confirm the cached version is still current with a strong
             // conditional request before returning any cached bytes.
-            match revalidate_cached(&state, &target, &key, &ver).await? {
+            match revalidate_cached(state, target, key, &ver).await? {
                 Revalidation::Fresh => {}
                 Revalidation::Changed(_) => {
                     // New representation committed; re-plan against it.
@@ -543,7 +586,7 @@ async fn serve(
 
         // All requested bytes cached for one proven version — read them.
         let read_ver = ver.clone();
-        match read_partial(&state, &read_ver, start, end_excl, total).await {
+        match read_partial(state, &read_ver, start, end_excl, total).await {
             Ok(resp) => return Ok(resp),
             Err(ProxyError::BlobTruncated) => {
                 // On-disk corruption: discard the bad metadata/bytes and
@@ -552,13 +595,193 @@ async fn serve(
                     return Err(ProxyError::BlobTruncated);
                 }
                 repairs += 1;
-                repair_version(&state, ver.id).await?;
+                repair_version(state, ver.id).await?;
                 continue;
             }
             Err(e) => return Err(e),
         }
     }
     Err(ProxyError::State("upstream version churn; giving up".into()))
+}
+
+// ---------------------------------------------------------------------------
+// Client version lock (`If-Match`: one strong entity-tag)
+// ---------------------------------------------------------------------------
+
+/// Parse the optional `If-Match` version lock. This proxy implements
+/// `If-Match` strictly as a lock on ONE strong entity-tag (RFC 9110
+/// §13.1.1 strong comparison): a weak tag can never prove byte identity
+/// (412), and `*`, lists, duplicated headers or garbage are refused (400)
+/// rather than silently ignored.
+fn parse_version_lock(headers: &HeaderMap) -> Result<Option<ETag>> {
+    let mut values = headers.get_all(axum::http::header::IF_MATCH).iter();
+    let raw = match (values.next(), values.next()) {
+        (None, _) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(ProxyError::LockMalformed(
+                "multiple If-Match headers; expected exactly one strong entity-tag".into(),
+            ))
+        }
+        (Some(v), None) => v
+            .to_str()
+            .map_err(|_| ProxyError::LockMalformed("header value is not valid text".into()))?,
+    };
+    match ETag::parse_lock(raw) {
+        Ok(tag) => Ok(Some(tag)),
+        Err(crate::etag::LockError::Weak) => Err(ProxyError::LockMismatch(
+            "weak validators cannot lock a byte-exact version".into(),
+        )),
+        Err(crate::etag::LockError::Malformed) => Err(ProxyError::LockMalformed(
+            "expected exactly one strong entity-tag, e.g. If-Match: \"v1\"".into(),
+        )),
+    }
+}
+
+/// Result of the upfront version query for a locked request.
+enum LockCheck {
+    /// Upstream confirmed (304) that the locked tag is the current version.
+    Confirmed,
+    /// Upstream sent the full current representation and it IS the locked
+    /// version; the fresh body has been committed to the cache.
+    Committed(VersionRow),
+}
+
+/// Ask the upstream for the current version before any cache byte is
+/// trusted: a conditional GET with `If-None-Match: <lock>`.
+///
+/// * 304 — the locked tag is current; cached bytes of that version may be
+///   used (the usual per-request revalidation still applies).
+/// * 200 — the fresh representation's strong ETag decides. Equal means the
+///   lock holds and the body is committed as proof-fresh. A different
+///   strong tag means the object changed (equal length proves nothing):
+///   the new version is committed for later requests, but THIS request
+///   fails 412 without a body. A weak or missing validator means the
+///   version cannot be guaranteed at all.
+async fn confirm_lock_version(
+    state: &ProxyState,
+    target: &url::Url,
+    key: &str,
+    lock: &ETag,
+) -> Result<LockCheck> {
+    let inm = lock.to_wire();
+    let (status, cap) = capture_upstream(state, target, None, None, Some(&inm)).await?;
+    match status {
+        reqwest::StatusCode::NOT_MODIFIED => match &cap.etag {
+            // The 304 asserts the lock is current; a validator sent along
+            // with it must agree by strong comparison.
+            Some(t) if crate::etag::strong_equal(t, lock) => Ok(LockCheck::Confirmed),
+            // A weak validator proves nothing about exact bytes.
+            Some(t) if t.weak => Err(ProxyError::LockMismatch(
+                "upstream validator is weak; the locked version cannot be guaranteed".into(),
+            )),
+            // A contradicting strong validator on a 304 is an upstream bug,
+            // not a confirmation.
+            Some(_) => Err(ProxyError::TruncatedUpstream),
+            // No validator on the 304: the 304 itself is the confirmation.
+            None => Ok(LockCheck::Confirmed),
+        },
+        reqwest::StatusCode::OK => match cap.etag.clone() {
+            Some(t) if !t.weak && t.raw_tag == lock.raw_tag => {
+                match commit_200(state, key, cap).await? {
+                    CommitOutcome::Strong(v) => Ok(LockCheck::Committed(v)),
+                    // A strong tag was verified above, so this cannot happen.
+                    CommitOutcome::Uncached(_) => Err(ProxyError::State(
+                        "commit of a strong-validator capture was refused".into(),
+                    )),
+                }
+            }
+            Some(t) if !t.weak => {
+                // The object changed (possibly to a same-length body —
+                // length proves nothing). Cache the fresh representation
+                // for later unlocked requests, but THIS locked request
+                // fails without a body.
+                commit_200(state, key, cap).await?;
+                Err(ProxyError::LockMismatch(format!(
+                    "object changed: current version is {}, request locked to {}",
+                    t.to_wire(),
+                    lock.to_wire()
+                )))
+            }
+            _ => Err(ProxyError::LockMismatch(
+                "upstream sent no strong validator; the locked version cannot be guaranteed".into(),
+            )),
+        },
+        _ => Err(ProxyError::TruncatedUpstream),
+    }
+}
+
+/// Locked plain GET (no usable Range) after the version query confirmed
+/// the lock: serve the locked version's full body from cache when it is
+/// already complete — reusing verified bytes is the point of the lock —
+/// and fetch it from the upstream otherwise. The final response guard
+/// still rejects anything but the locked version.
+async fn locked_full_get(
+    state: &Arc<ProxyState>,
+    target: &url::Url,
+    key: &str,
+    lock: &ETag,
+    committed: Option<VersionRow>,
+) -> Result<Response> {
+    // The version query may already have fetched (and committed) the full
+    // locked representation; otherwise look it up in the cache.
+    let ver = match committed {
+        Some(v) => Some(v),
+        None => {
+            let key_find = key.to_string();
+            let tag = lock.raw_tag.clone();
+            with_db(state, move |c| crate::db::find_version(c, &key_find, &tag)).await?
+        }
+    };
+    if let Some(v) = ver {
+        if let Some(total) = v.total_length {
+            let vid = v.id;
+            let covered = with_db(state, move |c| crate::db::covered_segments(c, vid)).await?;
+            if covered == [(0, total)] {
+                match read_checked(state, vid, 0, total).await {
+                    Ok(body) => {
+                        return Ok(build_response(StatusCode::OK, common_headers(&v), body))
+                    }
+                    Err(ProxyError::BlobTruncated) => {
+                        // Damaged cache: drop the bad segments/bytes and
+                        // fall through to a full fetch.
+                        repair_version(state, vid).await?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    full_get(state, target).await
+}
+
+/// Final guard for a locked request: a 200/206 response may only carry the
+/// locked version's bytes. Every serve point tags its response with the
+/// version it actually read, so a mismatch here means the representation
+/// changed mid-request (or cannot be identified) — fail 412 and let the
+/// client receive no body at all.
+fn enforce_version_lock(resp: Response, lock: &ETag) -> Result<Response> {
+    if !matches!(resp.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT) {
+        return Ok(resp);
+    }
+    let served = resp
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .and_then(ETag::parse);
+    match served {
+        Some(t) if crate::etag::strong_equal(&t, lock) => Ok(resp),
+        Some(t) if t.weak => Err(ProxyError::LockMismatch(
+            "upstream validator is weak; the locked version cannot be guaranteed".into(),
+        )),
+        Some(t) => Err(ProxyError::LockMismatch(format!(
+            "representation changed to {} while serving the lock on {}",
+            t.to_wire(),
+            lock.to_wire()
+        ))),
+        None => Err(ProxyError::LockMismatch(
+            "upstream sent no validator; the locked version cannot be guaranteed".into(),
+        )),
+    }
 }
 
 /// Result of validating a cached version against the upstream.
@@ -697,7 +920,7 @@ async fn unsatisfiable(
         raw_tag: ver.etag_tag.clone(),
     }
     .to_wire();
-    let (status, cap) = capture_upstream(state, target, Some(range_hdr), Some(&ir)).await?;
+    let (status, cap) = capture_upstream(state, target, Some(range_hdr), Some(&ir), None).await?;
     match status {
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
             let h = HeaderMap::from_iter([(
@@ -736,7 +959,7 @@ async fn cold_range(
     range_hdr: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<ColdOutcome> {
-    let (status, cap) = capture_upstream(state, target, range_hdr, if_range).await?;
+    let (status, cap) = capture_upstream(state, target, range_hdr, if_range, None).await?;
     match status {
         reqwest::StatusCode::OK => Ok(ColdOutcome::Reply(match commit_200(state, key, cap).await? {
             CommitOutcome::Strong(v) => {
@@ -783,7 +1006,7 @@ async fn multipart_forward(
     range_hdr: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<Response> {
-    let (status, cap) = capture_upstream(state, target, range_hdr, if_range).await?;
+    let (status, cap) = capture_upstream(state, target, range_hdr, if_range, None).await?;
     let body = cap.spool.read_bytes().await?;
     let sc = match status {
         reqwest::StatusCode::OK => StatusCode::OK,
@@ -797,7 +1020,7 @@ async fn multipart_forward(
 /// Plain GET (no usable Range header). Always revalidates upstream.
 async fn full_get(state: &ProxyState, target: &url::Url) -> Result<Response> {
     let key = target_key(target);
-    let (status, cap) = capture_upstream(state, target, None, None).await?;
+    let (status, cap) = capture_upstream(state, target, None, None, None).await?;
     match status {
         reqwest::StatusCode::OK => Ok(match commit_200(state, &key, cap).await? {
             CommitOutcome::Strong(v) => {

@@ -41,6 +41,34 @@ impl ETag {
             format!("\"{}\"", self.raw_tag)
         }
     }
+
+    /// Parse a client `If-Match` version-lock value. The lock is
+    /// deliberately strict — exactly one strong entity-tag — so a request
+    /// that asks for one specific object version is never silently treated
+    /// as unlocked: `*`, lists and garbage are malformed, and a weak tag is
+    /// reported separately (well-formed, but it proves nothing about exact
+    /// bytes).
+    pub fn parse_lock(value: &str) -> Result<ETag, LockError> {
+        let v = value.trim();
+        if v == "*" || v.contains(',') {
+            return Err(LockError::Malformed);
+        }
+        match ETag::parse(v) {
+            Some(t) if t.weak => Err(LockError::Weak),
+            Some(t) => Ok(t),
+            None => Err(LockError::Malformed),
+        }
+    }
+}
+
+/// Why a client-supplied version lock value was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockError {
+    /// Not exactly one well-formed entity-tag (`*`, several tags, garbage).
+    Malformed,
+    /// A weak entity-tag: it can never prove byte identity, so it cannot
+    /// lock a version.
+    Weak,
 }
 
 /// Strong comparison (RFC 9110 §8.8.3.2): both validators MUST be strong and
@@ -74,5 +102,20 @@ mod tests {
         assert!(ETag::parse("\"a\" \"b\"").is_none());
         assert_eq!(s.to_wire(), "\"abc\"");
         assert_eq!(w.to_wire(), "W/\"abc\"");
+    }
+
+    #[test]
+    fn version_lock_values() {
+        // Exactly one strong tag locks the version.
+        let t = ETag::parse_lock("\"v1\"").unwrap();
+        assert!(!t.weak && t.raw_tag == "v1");
+        // A weak tag is well-formed but can never prove byte identity.
+        assert_eq!(ETag::parse_lock("W/\"v1\""), Err(LockError::Weak));
+        // Everything else is malformed and must never be silently ignored.
+        assert_eq!(ETag::parse_lock("*"), Err(LockError::Malformed));
+        assert_eq!(ETag::parse_lock("\"a\", \"b\""), Err(LockError::Malformed));
+        assert_eq!(ETag::parse_lock("v1"), Err(LockError::Malformed));
+        assert_eq!(ETag::parse_lock(""), Err(LockError::Malformed));
+        assert_eq!(ETag::parse_lock("\"unclosed"), Err(LockError::Malformed));
     }
 }

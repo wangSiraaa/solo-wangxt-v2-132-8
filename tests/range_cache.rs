@@ -577,6 +577,193 @@ async fn only_configured_upstream_is_reachable() {
 }
 
 // ---------------------------------------------------------------------------
+// 12. Version lock (If-Match): when the locked tag is current, full and
+//     single-range responses are byte-exact — served from cache or origin.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn version_lock_match_serves_full_and_single_range() {
+    let env = spawn_env().await;
+    let total = 300_000usize;
+    let expected = support::object_bytes("alpha-v1", total);
+    reset_stats(&env).await;
+
+    // Locked full GET on a cold cache: version query + fetch, exact bytes.
+    let resp = get(&env, "/obj/alpha", &[("If-Match", "\"alpha-v1\"")]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected));
+
+    // Locked single range, now fully warm: byte-exact and served without
+    // any additional upstream body bytes (conditional requests only).
+    let before = stats_for(&env, "alpha").await;
+    let resp = get(
+        &env,
+        "/obj/alpha",
+        &[("If-Match", "\"alpha-v1\""), ("Range", "bytes=1000-1999")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"alpha-v1\""));
+    assert_eq!(hdr(&resp, "content-range"), Some("bytes 1000-1999/300000"));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected[1000..2000]));
+    let after = stats_for(&env, "alpha").await;
+    assert_eq!(
+        after["bytes_sent"], before["bytes_sent"],
+        "warm locked range must not fetch body bytes"
+    );
+
+    // Warm locked full GET: the whole body comes from the cache after the
+    // upstream confirmed the version — still zero body bytes upstream.
+    let before = stats_for(&env, "alpha").await;
+    let resp = get(&env, "/obj/alpha", &[("If-Match", "\"alpha-v1\"")]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected));
+    let after = stats_for(&env, "alpha").await;
+    assert_eq!(after["bytes_sent"], before["bytes_sent"]);
+
+    // Locked range on a cold object (suffix form): 206 with exact bytes.
+    let tiny = support::object_bytes("tiny-v1", 300);
+    let resp = get(
+        &env,
+        "/obj/tiny",
+        &[("If-Match", "\"tiny-v1\""), ("Range", "bytes=-50")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&tiny[250..]));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Same-length version change: a stale lock fails 412 with NO body
+//     (neither old nor new bytes); unlocked requests still get the new
+//     version.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn version_lock_stale_fails_after_same_length_roll() {
+    let env = spawn_env().await;
+    let len = 120_000usize;
+    let v0 = support::mutable_bytes(0, len);
+    reset_stats(&env).await;
+
+    // Warm v0 with a range request.
+    let resp = get(&env, "/obj/mutable", &[("Range", "bytes=0-999")]).await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v0[0..1000]));
+
+    // Locked request while v0 is current: served fine.
+    let resp = get(
+        &env,
+        "/obj/mutable",
+        &[("If-Match", "\"mutable-v0\""), ("Range", "bytes=0-99")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v0[0..100]));
+
+    // Upstream rolls to v1: same length, completely different bytes.
+    let roll = env
+        .client
+        .post(format!("{}/obj/mutable", env.upstream))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(roll.status(), 200);
+    let v1 = support::mutable_bytes(1, len);
+    assert_ne!(sha256_hex(&v0), sha256_hex(&v1));
+
+    // Locked to the OLD value: 412, and the response carries neither the
+    // old nor the new representation (full GET and range request alike).
+    for headers in [
+        vec![("If-Match", "\"mutable-v0\"")],
+        vec![("If-Match", "\"mutable-v0\""), ("Range", "bytes=0-99")],
+    ] {
+        let resp = get(&env, "/obj/mutable", &headers).await;
+        assert_eq!(resp.status(), 412, "stale lock must fail: {headers:?}");
+        assert!(hdr(&resp, "etag").is_none(), "412 must not name a version");
+        let body = resp.bytes().await.unwrap();
+        assert!(body.len() < 1024, "412 carries an explanation, not a body");
+        assert_ne!(sha256_hex(&body), sha256_hex(&v0));
+        assert_ne!(sha256_hex(&body), sha256_hex(&v1));
+        assert_ne!(sha256_hex(&body), sha256_hex(&v0[0..100]));
+        assert_ne!(sha256_hex(&body), sha256_hex(&v1[0..100]));
+    }
+
+    // Locked to the NEW value: succeeds with v1 bytes.
+    let resp = get(
+        &env,
+        "/obj/mutable",
+        &[("If-Match", "\"mutable-v1\""), ("Range", "bytes=100-199")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(hdr(&resp, "etag"), Some("\"mutable-v1\""));
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1[100..200]));
+
+    // Ordinary requests (no lock) still succeed with the NEW version.
+    let resp = get(&env, "/obj/mutable", &[]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1));
+    let resp = get(&env, "/obj/mutable", &[("Range", "bytes=0-99")]).await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&v1[0..100]));
+}
+
+// ---------------------------------------------------------------------------
+// 14. Lock values that cannot guarantee a version are rejected: weak tags
+//     (412), malformed values (400, before any upstream request), objects
+//     whose upstream has no strong validator (412). Unlocked GETs are
+//     unaffected by all of it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn version_lock_rejects_unverifiable_values() {
+    let env = spawn_env().await;
+    reset_stats(&env).await;
+
+    // Weak lock value: syntactically valid but can never prove bytes -> 412.
+    let resp = get(&env, "/obj/alpha", &[("If-Match", "W/\"alpha-v1\"")]).await;
+    assert_eq!(resp.status(), 412);
+
+    // Malformed lock values -> 400, and no upstream request is made.
+    let before = stats_for(&env, "alpha").await;
+    for bad in ["alpha-v1", "*", "\"a\" \"b\"", "\"a\",\"b\"", "\"unclosed"] {
+        let resp = get(&env, "/obj/alpha", &[("If-Match", bad)]).await;
+        assert_eq!(resp.status(), 400, "If-Match: {bad}");
+    }
+    let after = stats_for(&env, "alpha").await;
+    assert_eq!(
+        before.get("requests").copied().unwrap_or(0),
+        after.get("requests").copied().unwrap_or(0),
+        "malformed locks must be rejected before any upstream request"
+    );
+
+    // Object with only a weak validator: the version cannot be guaranteed.
+    let resp = get(&env, "/obj/weak", &[("If-Match", "\"weak-v1\"")]).await;
+    assert_eq!(resp.status(), 412);
+    // Object with no validator at all.
+    let resp = get(&env, "/obj/noetag", &[("If-Match", "\"anything\"")]).await;
+    assert_eq!(resp.status(), 412);
+
+    // Unlocked requests are unaffected by all of the above.
+    let expected = support::object_bytes("alpha-v1", 300_000);
+    let resp = get(&env, "/obj/alpha", &[]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(sha256_hex(&body), sha256_hex(&expected));
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
